@@ -69,8 +69,8 @@ def build_row(stock_id, name, snap, fund, tech, inst, theme, pe_below, score, ra
 def run_screen(max_deep=None, log=print):
     """執行完整篩選，回傳 (full_df, sublists, params_used, passed)。供 CLI 與 Streamlit 共用。"""
     log("① 取得全市場快照（證交所＋櫃買）…")
-    snap = ds.get_market_snapshot()
-    uni = ds.get_universe()
+    snap = ds.get_market_snapshot(log=log)
+    uni = ds.get_universe(log=log)
     snap = snap.merge(uni[["stock_id", "industry"]], on="stock_id", how="left")
     log(f"   全市場有效個股：{len(snap)}")
 

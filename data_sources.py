@@ -18,9 +18,13 @@ import time
 import datetime as dt
 
 import requests
+import urllib3
 import pandas as pd
 
 import config
+
+# 部分官方端點（如櫃買）憑證鏈不完整，必要時會以 verify=False 重試；關閉相關警告噪音。
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TWSE = "https://openapi.twse.com.tw/v1"
 TPEX = "https://www.tpex.org.tw/openapi/v1"
@@ -73,6 +77,52 @@ def _save_cache_df(df: pd.DataFrame, name: str):
 
 
 # ===========================================================================
+# 內建快照（seed）：當雲端主機被資料來源 WAF 阻擋、無法即時抓取時的後備資料。
+# 由 `python make_seed.py` 在本機產生並 commit 進 repo（見 seed/）。
+# ===========================================================================
+SEED_DIR = os.path.join(config.BASE_DIR, "seed")
+
+
+def _seed_path(name: str) -> str:
+    return os.path.join(SEED_DIR, name)
+
+
+def _load_seed_df(name: str):
+    """讀取內建快照（parquet 優先，CSV 後備）；不存在則回 None。"""
+    for path in (_seed_path(name), _seed_path(name).replace(".parquet", ".csv")):
+        if os.path.exists(path):
+            try:
+                if path.endswith(".parquet"):
+                    return pd.read_parquet(path)
+                return pd.read_csv(path, dtype={"stock_id": str})
+            except Exception:
+                continue
+    return None
+
+
+def _seed_date(name: str) -> str:
+    """內建快照檔案的最後更新日期字串（給使用者參考資料新鮮度）。"""
+    for path in (_seed_path(name), _seed_path(name).replace(".parquet", ".csv")):
+        if os.path.exists(path):
+            ts = os.path.getmtime(path)
+            return dt.date.fromtimestamp(ts).isoformat()
+    return "未知"
+
+
+def save_seed(log=print):
+    """即時抓取全市場快照與清單，存進 seed/ 供雲端後備使用。供 make_seed.py 呼叫。"""
+    os.makedirs(SEED_DIR, exist_ok=True)
+    log("抓取全市場快照（證交所＋櫃買）…")
+    snap = _fetch_market_snapshot()
+    snap.to_parquet(_seed_path("snapshot.parquet"), index=False)
+    log(f"  已存 seed/snapshot.parquet（{len(snap)} 檔）")
+    log("抓取全市場清單（FinMind）…")
+    uni = _fetch_universe()
+    uni.to_parquet(_seed_path("universe.parquet"), index=False)
+    log(f"  已存 seed/universe.parquet（{len(uni)} 檔）")
+
+
+# ===========================================================================
 # 證交所 / 櫃買：全市場批次
 # ===========================================================================
 def _get_json(url: str, retries: int = 3):
@@ -86,9 +136,12 @@ def _get_json(url: str, retries: int = 3):
     last_err = None
     snippet = ""
     status = None
+    # 櫃買（tpex.org.tw）的伺服器憑證在較新的 OpenSSL 上會因
+    # 「Missing Subject Key Identifier」驗證失敗；該主機抓 SSL 錯誤時退回不驗證憑證。
+    verify = True
     for attempt in range(retries):
         try:
-            r = _session.get(url, timeout=40)
+            r = _session.get(url, timeout=40, verify=verify)
             status = r.status_code
             r.raise_for_status()
             # 不完全信任 content-type：有些來源把合法 JSON 標成 text/html。
@@ -97,6 +150,11 @@ def _get_json(url: str, retries: int = 3):
             except ValueError:
                 snippet = (r.text or "")[:200].replace("\n", " ")
                 last_err = "回應非 JSON"
+        except requests.exceptions.SSLError as e:
+            last_err = f"SSL 憑證驗證失敗：{e}"
+            if verify:
+                verify = False  # 下一輪不驗證憑證重試（僅限公開資料端點）
+                continue
         except requests.RequestException as e:
             last_err = str(e)
         if attempt < retries - 1:
@@ -115,15 +173,30 @@ def _to_num(x):
         return None
 
 
-def get_market_snapshot() -> pd.DataFrame:
+def get_market_snapshot(log=print) -> pd.DataFrame:
     """
     取得全市場（上市+上櫃）最新一日的價量與估值快照。
     欄位：stock_id, name, close, lots(成交張數), pe, pb, yield_pct, board
+
+    優先序：當日快取 → 即時抓取 → 內建快照（seed，雲端被阻擋時的後備）。
     """
     cached = _load_cache_df("snapshot.parquet")
     if cached is not None:
         return cached
+    try:
+        df = _fetch_market_snapshot()
+        _save_cache_df(df, "snapshot.parquet")
+        return df
+    except Exception as e:
+        seed = _load_seed_df("snapshot.parquet")
+        if seed is not None:
+            log(f"⚠ 即時抓取快照失敗（{e}）；改用內建快照 seed（{_seed_date('snapshot.parquet')}）。")
+            return seed
+        raise
 
+
+def _fetch_market_snapshot() -> pd.DataFrame:
+    """實際向證交所／櫃買 OpenAPI 抓取全市場快照（不含快取／後備邏輯）。"""
     rows = []
 
     # --- 上市每日收盤 ---
@@ -184,17 +257,35 @@ def get_market_snapshot() -> pd.DataFrame:
     df["pb"] = df["stock_id"].map(lambda c: (pe_map.get(c) or {}).get("pb"))
     df["yield_pct"] = df["stock_id"].map(lambda c: (pe_map.get(c) or {}).get("yield_pct"))
     df = df[df["close"].notna() & (df["close"] > 0)].reset_index(drop=True)
-
-    _save_cache_df(df, "snapshot.parquet")
+    if df.empty:
+        raise ValueError("快照解析後無有效資料（來源可能回傳空內容或攔截頁）。")
     return df
 
 
-def get_universe() -> pd.DataFrame:
-    """全市場股票清單（含產業別），用於題材標記。欄位：stock_id, name, industry, board"""
+def get_universe(log=print) -> pd.DataFrame:
+    """全市場股票清單（含產業別），用於題材標記。欄位：stock_id, name, industry, board
+
+    優先序：當日快取 → 即時抓取 → 內建快照（seed）。
+    """
     cached = _load_cache_df("universe.parquet")
     if cached is not None:
         return cached
+    try:
+        df = _fetch_universe()
+        if not df.empty:
+            _save_cache_df(df, "universe.parquet")
+            return df
+        raise ValueError("FinMind 回傳空的股票清單。")
+    except Exception as e:
+        seed = _load_seed_df("universe.parquet")
+        if seed is not None:
+            log(f"⚠ 即時抓取清單失敗（{e}）；改用內建快照 seed（{_seed_date('universe.parquet')}）。")
+            return seed
+        raise
 
+
+def _fetch_universe() -> pd.DataFrame:
+    """實際向 FinMind 抓取全市場股票清單（不含快取／後備邏輯）。"""
     data = _finmind_raw("TaiwanStockInfo")
     df = pd.DataFrame(data)
     if df.empty:
@@ -206,7 +297,6 @@ def get_universe() -> pd.DataFrame:
     df["board"] = df["type"].map({"twse": "上市", "tpex": "上櫃"}).fillna("")
     df = df[["stock_id", "name", "industry", "board"]].drop_duplicates("stock_id")
     df = df[(df["stock_id"].str.len() == 4) & (~df["stock_id"].str.startswith("0"))]
-    _save_cache_df(df, "universe.parquet")
     return df
 
 

@@ -75,6 +75,25 @@ streamlit run app.py
 
    程式會自動讀取此 secret，不需改任何程式碼。
 
+#### 內建快照（seed）後備機制
+
+證交所／櫃買 OpenAPI 可能以「非台灣 IP」阻擋雲端主機（回傳攔截頁而非 JSON）。
+為此，全市場快照與股票清單支援**後備資料**：
+
+- 抓取優先序：**當日快取 → 即時抓取 → 內建快照 `seed/`**。
+- 當雲端即時抓取失敗時，自動改用 repo 內的 `seed/snapshot.parquet`、`seed/universe.parquet`，
+  介面會顯示「改用內建快照」與其資料日期，app 仍能跑出結果（資料為 seed 產生當日）。
+
+更新 seed（建議於本機、台灣 IP 環境，定期盤後執行）：
+
+```bash
+python make_seed.py     # 重新抓取並寫入 seed/
+git add seed/ && git commit -m "Update seed" && git push
+```
+
+> 註：逐檔基本面／法人資料來自 FinMind（`api.finmindtrade.com`），與證交所不同主機，
+> 雲端通常可正常連線；上述後備僅針對證交所／櫃買的全市場批次資料。
+
 ---
 
 ## 四、篩選邏輯重點
@@ -122,7 +141,9 @@ twstock_screener/
 ├─ excel_report.py    Excel 多工作表輸出
 ├─ run_screener.py    命令列主程式
 ├─ app.py             Streamlit 介面
+├─ make_seed.py       產生雲端後備快照（seed/）
 ├─ requirements.txt
+├─ seed/              內建快照後備（即時抓取被阻擋時使用）
 ├─ cache/             原始資料快取（同一天不重抓）
 └─ output/            Excel 輸出
 ```
