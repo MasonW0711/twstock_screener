@@ -52,9 +52,15 @@ if run:
         buf.append(str(msg))
         logs.code("\n".join(buf[-12:]))
 
-    with st.spinner("篩選中…（深掃越多檔越久）"):
-        df, sublists, params, passed = run_screener.run_screen(
-            max_deep=(None if max_deep == 0 else max_deep), log=log)
+    try:
+        with st.spinner("篩選中…（深掃越多檔越久）"):
+            df, sublists, params, passed = run_screener.run_screen(
+                max_deep=(None if max_deep == 0 else max_deep), log=log)
+    except Exception as e:
+        st.error(f"抓取資料失敗：{e}")
+        st.info("若部署在雲端（如 Streamlit Cloud），證交所／櫃買 OpenAPI 可能"
+                "以非台灣 IP 阻擋雲端主機。可改於本機執行，或稍後重試。")
+        st.stop()
     if df is None:
         st.warning("沒有任何個股通過全部條件，請放寬左側門檻後再試。")
         st.stop()

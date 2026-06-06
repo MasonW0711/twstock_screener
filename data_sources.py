@@ -25,7 +25,13 @@ import config
 TWSE = "https://openapi.twse.com.tw/v1"
 TPEX = "https://www.tpex.org.tw/openapi/v1"
 FINMIND = "https://api.finmindtrade.com/api/v4/data"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+}
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
@@ -69,13 +75,37 @@ def _save_cache_df(df: pd.DataFrame, name: str):
 # ===========================================================================
 # 證交所 / 櫃買：全市場批次
 # ===========================================================================
-def _get_json(url: str):
-    r = _session.get(url, timeout=40)
-    r.raise_for_status()
-    ct = r.headers.get("content-type", "")
-    if "json" not in ct:
-        raise ValueError(f"非 JSON 回應：{url}（端點可能已變更，請至官網確認）")
-    return r.json()
+def _get_json(url: str, retries: int = 3):
+    """
+    抓取證交所／櫃買 OpenAPI 並解析 JSON。
+
+    雲端主機（如 Streamlit Cloud，IP 在台灣以外）有時會收到防火牆／WAF 的
+    HTML 攔截頁而非 JSON。這裡不只看 content-type，直接嘗試解析 JSON，
+    並在失敗時重試；最終失敗會帶出 HTTP 狀態碼與回應片段以利除錯。
+    """
+    last_err = None
+    snippet = ""
+    status = None
+    for attempt in range(retries):
+        try:
+            r = _session.get(url, timeout=40)
+            status = r.status_code
+            r.raise_for_status()
+            # 不完全信任 content-type：有些來源把合法 JSON 標成 text/html。
+            try:
+                return r.json()
+            except ValueError:
+                snippet = (r.text or "")[:200].replace("\n", " ")
+                last_err = "回應非 JSON"
+        except requests.RequestException as e:
+            last_err = str(e)
+        if attempt < retries - 1:
+            time.sleep(2 * (attempt + 1))
+    raise ValueError(
+        f"無法取得有效 JSON：{url}（HTTP {status}）。"
+        f"原因：{last_err}。回應開頭：{snippet!r}。"
+        "雲端主機可能被資料來源的防火牆（WAF）以非台灣 IP 阻擋；"
+        "請改於本機執行，或為來源 IP 申請白名單。")
 
 
 def _to_num(x):
