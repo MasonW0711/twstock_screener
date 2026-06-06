@@ -26,7 +26,17 @@ import screener as sc
 import excel_report
 
 
-def build_row(stock_id, name, snap, fund, tech, inst, theme, pe_below, score, rating):
+def _pct(x):
+    """比率 → 百分比字串；None 顯示「資料不足」。"""
+    return f"{x:.1%}" if x is not None else config.NA_TEXT
+
+
+def _num(x, nd=2):
+    """數值四捨五入；None 顯示「資料不足」。"""
+    return round(x, nd) if x is not None else config.NA_TEXT
+
+
+def build_row(stock_id, name, snap, fund, tech, inst, theme, pe_below, score, rating, proxies):
     buy_zone, stop = sc.reference_levels(tech)
     risks = []
     if tech["below_year_line"]:
@@ -40,22 +50,35 @@ def build_row(stock_id, name, snap, fund, tech, inst, theme, pe_below, score, ra
     if not risks:
         risks.append("留意大盤系統性風險")
 
+    accel = fund.get("revenue_acceleration")
+    accel_txt = "是" if accel is True else ("否" if accel is False else config.NA_TEXT)
+
     return {
         "股票代號": stock_id,
         "股票名稱": name,
         "所屬產業": snap.get("industry", ""),
         "目前股價": round(snap["close"], 2) if snap.get("close") else "",
-        "2026 EPS預估": config.PAID_PLACEHOLDER,
-        "2027 EPS預估": config.PAID_PLACEHOLDER,
-        "預估成長率": config.PAID_PLACEHOLDER,
+        "成交量(張)": round(snap["lots"]) if snap.get("lots") else "",
         "本益比": round(snap["pe"], 1) if snap.get("pe") else "",
+        "ROE": _pct(fund.get("roe")),
+        "負債比": _pct(fund.get("debt_ratio")),
+        # ---- 免費替代指標（機械式計算，非預估、非投資建議）----
+        "近四季EPS": _num(fund.get("ttm_eps")),
+        "EPS年增率": _pct(fund.get("eps_yoy_ttm")),
+        "近3月營收YoY": _pct(fund.get("rev_yoy_3m_avg")),
+        "近6月營收YoY": _pct(fund.get("rev_yoy_6m_avg")),
+        "近12月營收YoY": _pct(fund.get("rev_yoy_ttm")),
+        "營收是否加速": accel_txt,
+        "估算合理價": _num(proxies.get("fair_price_proxy")),
+        "估算上漲空間": _pct(proxies.get("upside_proxy")),
+        "PEG替代值": _num(proxies.get("peg_proxy")),
         "法人近20日買賣超(張)": (
             f"外資{inst.get('foreign_net_lots', 0):+,}／投信{inst.get('trust_net_lots', 0):+,}"),
         "下半年成長題材": theme or "—",
         "主要風險": "、".join(risks),
         "建議買進區間": buy_zone,
         "停損區間": stop,
-        "預估合理價": config.PAID_PLACEHOLDER,
+        "評分": score,
         "投資評等": rating,
         # 以下為內部排序/分榜用欄位（不輸出到主表顯示順序，但保留於 DataFrame）
         "_score": score,
@@ -65,6 +88,8 @@ def build_row(stock_id, name, snap, fund, tech, inst, theme, pe_below, score, ra
         "_dist52w": tech.get("dist_from_52w_high"),
         "_theme": theme,
         "_pe_below": pe_below,
+        "_upside": proxies.get("upside_proxy"),
+        "_peg": proxies.get("peg_proxy"),
     }
 
 
@@ -112,11 +137,16 @@ def run_screen(max_deep=None, log=print):
             theme = themes.tag_themes(sid, s.get("industry", "") or "")
             pe = s.get("pe")
             pe_below = bool(pe and pe_ind.get(s.get("industry")) and pe < pe_ind[s.get("industry")])
-            base = {"close": s.get("close"), "pe": pe, "industry": s.get("industry", "")}
-            metric_row = dict(base, **fund, **tech, **inst, theme=theme, pe_below_industry=pe_below)
+            base = {"close": s.get("close"), "pe": pe,
+                    "industry": s.get("industry", ""), "lots": s.get("lots")}
+            proxies = sc.compute_valuation_proxies(
+                fund.get("ttm_eps"), pe, pe_ind.get(s.get("industry")),
+                s.get("close"), fund.get("eps_yoy_ttm"))
+            metric_row = dict(base, **fund, **tech, **inst, **proxies,
+                              theme=theme, pe_below_industry=pe_below)
             score, rating = sc.score_and_rate(metric_row)
             row = build_row(sid, s["name"], base, fund, tech, inst,
-                            theme, pe_below, score, rating)
+                            theme, pe_below, score, rating, proxies)
             return True, row, f"{sid} {s['name']} ✓ 入選 評分{score} {rating}", False
         except ds.RateLimitError:
             return False, None, f"FinMind 重試後仍達流量限制，已略過 {sid}，不影響其他股票。", True

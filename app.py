@@ -97,6 +97,8 @@ if "result" in st.session_state:
 
     st.subheader(f"主表・前 {config.TOP_N} 名")
     st.dataframe(view[show].head(config.TOP_N), use_container_width=True, hide_index=True)
+    st.caption("估算合理價、估算上漲空間、PEG替代值，皆為公開資料機械式計算結果，"
+               "不是券商共識目標價，也不是投資建議。")
 
     st.subheader("四大子榜")
     tabs = st.tabs(list(sublists.keys()))
@@ -113,4 +115,5 @@ if "result" in st.session_state:
                            file_name=path.split("/")[-1],
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("請於左側設定參數後按「執行篩選」。前瞻性欄位（2026/27 EPS 預估、目標價、PEG）需付費資料源，已於報表中標記。")
+    st.info("請於左側設定參數後按「執行篩選」。EPS／營收成長、估算合理價、PEG替代值等欄位，"
+            "皆由免費公開資料（FinMind 財報與月營收）機械式計算，非券商預估、非投資建議。")

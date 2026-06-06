@@ -9,21 +9,24 @@ from openpyxl.utils import get_column_letter
 
 import config
 
-# 主表 15 欄（依需求）
+# 主表 24 欄：基本資訊 ＋ 免費替代指標（皆為公開資料機械式計算，非投資建議）
 COLUMNS = [
-    "股票代號", "股票名稱", "所屬產業", "目前股價",
-    "2026 EPS預估", "2027 EPS預估", "預估成長率", "本益比",
+    "股票代號", "股票名稱", "所屬產業", "目前股價", "成交量(張)",
+    "本益比", "ROE", "負債比",
+    "近四季EPS", "EPS年增率", "近3月營收YoY", "近6月營收YoY", "近12月營收YoY",
+    "營收是否加速", "估算合理價", "估算上漲空間", "PEG替代值",
     "法人近20日買賣超(張)", "下半年成長題材", "主要風險",
-    "建議買進區間", "停損區間", "預估合理價", "投資評等",
+    "建議買進區間", "停損區間", "評分", "投資評等",
 ]
 
 _HEAD_FILL = PatternFill("solid", fgColor="1F3864")
 _HEAD_FONT = Font(name="Microsoft JhengHei", bold=True, color="FFFFFF", size=10)
-_PAID_FILL = PatternFill("solid", fgColor="FFF2CC")  # 需付費欄位淡黃底
+_ESTIMATE_FILL = PatternFill("solid", fgColor="FFF2CC")  # 機械式估算欄位淡黃底
 _CELL_FONT = Font(name="Microsoft JhengHei", size=10)
 _TITLE_FONT = Font(name="Microsoft JhengHei", bold=True, size=13, color="1F3864")
 _BORDER = Border(*(Side(style="thin", color="D9D9D9"),) * 4)
-_PAID_COLS = {"2026 EPS預估", "2027 EPS預估", "預估成長率", "預估合理價"}
+# 標示為「機械式估算」的欄位（淡黃底提醒：非券商目標價／法人預估）
+_ESTIMATE_COLS = {"估算合理價", "估算上漲空間", "PEG替代值"}
 
 
 def _write_table(ws, df: pd.DataFrame, title: str):
@@ -43,9 +46,10 @@ def _write_table(ws, df: pd.DataFrame, title: str):
             c.font = _CELL_FONT
             c.border = _BORDER
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            if col in _PAID_COLS:
-                c.fill = _PAID_FILL
-    widths = [9, 11, 13, 9, 12, 12, 10, 8, 16, 22, 26, 18, 16, 12, 9]
+            if col in _ESTIMATE_COLS:
+                c.fill = _ESTIMATE_FILL
+    widths = [9, 11, 13, 9, 9, 7, 7, 7, 9, 9, 10, 10, 10, 9, 10, 11, 9,
+              16, 20, 24, 18, 16, 7, 8]
     for j, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(j)].width = w
     ws.freeze_panes = ws.cell(row=start + 1, column=1)
@@ -63,9 +67,14 @@ def _write_notes(ws, params_used: dict, total_passed: int):
         "  價量/估值：證券交易所 OpenAPI、櫃買中心 OpenAPI（全市場批次）",
         "  基本面/法人：FinMind 開放資料（逐檔）",
         "",
-        "【需付費資料源・本表以淡黃底標記的欄位】",
-        "  2026/2027 EPS 預估、預估成長率、預估合理價、法人共識目標價、PEG，",
-        "  免費來源無法取得，需 TEJ／CMoney 等付費資料庫或券商研究報告補入。",
+        "【免費替代指標說明・本表以淡黃底標記的估算欄位】",
+        "  本系統不使用任何付費預估資料（不抓券商共識 EPS／目標價／法人預估）。",
+        "  EPS 年增率、近3/6/12月營收 YoY、估算合理價、PEG 替代值，",
+        "  皆由公開歷史資料（FinMind 財報與月營收）機械式計算。",
+        "  ・估算合理價 = 近四季EPS × 同產業 PE 中位數（不是券商目標價）。",
+        "  ・估算上漲空間 = 估算合理價 ÷ 現價 − 1。",
+        "  ・PEG 替代值 = 本益比 ÷ EPS年增率(%)（不是法人預估 PEG）。",
+        "  以上僅供篩選參考，資料不足者顯示「資料不足」，非投資建議。",
         "",
         "【套用門檻】",
         f"  最近四季單季 EPS 皆為正：{params_used['eps']}",

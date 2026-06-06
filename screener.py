@@ -117,6 +117,10 @@ def compute_fundamentals(income_df, bs_df, revenue_df):
     m["rev_yoy"] = _revenue_ttm_yoy(revenue_df)
     m["rev_yoy_ok"] = m["rev_yoy"] is not None and m["rev_yoy"] > config.MIN_REVENUE_YOY
 
+    # ---- 免費替代指標（公開歷史資料機械式計算，非預估、非投資建議）----
+    m.update(_eps_free_metrics(eps_q))
+    m.update(_revenue_free_metrics(revenue_df, m["rev_yoy"]))
+
     return m
 
 
@@ -132,6 +136,44 @@ def _revenue_ttm_yoy(revenue_df: pd.DataFrame):
     if ttm_prev == 0:
         return None
     return ttm_now / ttm_prev - 1
+
+
+def _eps_free_metrics(eps_q):
+    """由 EPS 單季序列 [(year,q,value),...] 算免費替代指標；資料不足回 None。"""
+    vals = [v for (_, _, v) in eps_q]
+    out = {"ttm_eps": None, "eps_yoy_ttm": None,
+           "eps_trend_8q": None, "eps_positive_quarters": None}
+    if not vals:
+        return out
+    if len(vals) >= 4:
+        out["ttm_eps"] = sum(vals[-4:])                      # 最近四季 EPS 合計
+    if len(vals) >= 8:                                       # 近四季合計 vs 前四季合計
+        now, prev = sum(vals[-4:]), sum(vals[-8:-4])
+        if prev > 0:                                         # 前期須為正才有意義
+            out["eps_yoy_ttm"] = now / prev - 1
+    recent = vals[-8:]                                       # 近八季趨勢
+    if len(recent) >= 4:
+        out["eps_trend_8q"] = float(np.polyfit(np.arange(len(recent)), recent, 1)[0])
+        out["eps_positive_quarters"] = sum(1 for v in recent if v > 0)
+    return out
+
+
+def _revenue_free_metrics(revenue_df: pd.DataFrame, rev_yoy_ttm):
+    """由月營收算 3/6 月 YoY 平均與是否加速；資料不足回 None。"""
+    out = {"rev_yoy_ttm": rev_yoy_ttm, "rev_yoy_3m_avg": None,
+           "rev_yoy_6m_avg": None, "revenue_acceleration": None}
+    if revenue_df.empty or "revenue" not in revenue_df.columns:
+        return out
+    rev = revenue_df.sort_values("date")["revenue"].astype(float).tolist()
+    # 月 YoY 序列：rev[i] / rev[i-12] - 1（同月前一年須 > 0）
+    yoy = [rev[i] / rev[i - 12] - 1 for i in range(12, len(rev)) if rev[i - 12] > 0]
+    if len(yoy) >= 3:
+        out["rev_yoy_3m_avg"] = sum(yoy[-3:]) / 3
+    if len(yoy) >= 6:
+        out["rev_yoy_6m_avg"] = sum(yoy[-6:]) / 6
+    if out["rev_yoy_3m_avg"] is not None and rev_yoy_ttm is not None:
+        out["revenue_acceleration"] = out["rev_yoy_3m_avg"] > rev_yoy_ttm
+    return out
 
 
 def fundamentals_pass(m) -> bool:
@@ -243,6 +285,32 @@ def industry_pe_table(snapshot: pd.DataFrame, universe: pd.DataFrame):
     return df.groupby("industry")["pe"].agg(agg).to_dict()
 
 
+def compute_valuation_proxies(ttm_eps, pe, industry_pe_median, current_price, eps_yoy_ttm):
+    """免費估值替代指標（機械式計算，非券商目標價／法人預估，非投資建議）。
+
+    回 dict：
+      fair_price_proxy = ttm_eps × 產業PE中位數
+      upside_proxy     = fair_price_proxy / 現價 - 1
+      peg_proxy        = pe / (eps_yoy_ttm × 100)
+    任一輸入不合格則對應值為 None。
+    """
+    out = {"fair_price_proxy": None, "upside_proxy": None, "peg_proxy": None}
+
+    # 估算合理價：需 ttm_eps>0 且產業PE中位數有效（0<pe<=200）
+    if (ttm_eps is not None and ttm_eps > 0 and industry_pe_median is not None
+            and 0 < industry_pe_median <= 200):
+        out["fair_price_proxy"] = ttm_eps * industry_pe_median
+        if current_price and current_price > 0:
+            out["upside_proxy"] = out["fair_price_proxy"] / current_price - 1
+
+    # PEG 替代值：需 pe>0、eps 年增率>0 且不過小（避免分母過小失真）
+    if (pe is not None and pe > 0 and eps_yoy_ttm is not None
+            and eps_yoy_ttm >= config.PEG_MIN_GROWTH):
+        out["peg_proxy"] = pe / (eps_yoy_ttm * 100)
+
+    return out
+
+
 # ===========================================================================
 # 評分 → 評等（純條件符合度，非投資建議）
 # ===========================================================================
@@ -267,6 +335,16 @@ def score_and_rate(row) -> tuple:
     if row.get("pullback_zone"):
         score += 1
     if row.get("theme"):
+        score += 1
+
+    # 免費替代指標加分（缺資料不加、不扣；異常值因條件不成立而自動不計）
+    if row.get("eps_yoy_ttm") and row["eps_yoy_ttm"] > 0.20:
+        score += 1
+    if row.get("revenue_acceleration") is True:
+        score += 1
+    if row.get("upside_proxy") and row["upside_proxy"] > 0.20:
+        score += 1
+    if row.get("peg_proxy") and row["peg_proxy"] < 1.5:
         score += 1
 
     if score >= 7:
