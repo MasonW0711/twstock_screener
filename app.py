@@ -41,7 +41,18 @@ with st.sidebar:
     max_deep = st.number_input(
         "深掃檔數上限（依流動性取前 N；0＝全市場）", 0, 2000, 300, 50,
         help="全市場（0）較慢，建議先用 300 試跑。建議先設定 FINMIND_TOKEN 環境變數以提高流量上限。")
+    safe_mode = st.checkbox(
+        "安全模式：降低 FinMind 限流風險", value=config.SAFE_MODE,
+        help="勾選後使用保守設定（單緒、請求間隔 1 秒、深掃上限 100 檔），最不易觸發 FinMind 402 限流。")
     run = st.button("執行篩選", type="primary")
+
+# 安全模式：套用保守的 FinMind 設定，並把深掃檔數壓到 100 檔以內。
+if safe_mode:
+    config.apply_safe_mode()
+    if max_deep == 0 or max_deep > 100:
+        max_deep = 100
+else:
+    config.SAFE_MODE = False
 
 # ---------------- 執行 ----------------
 if run:

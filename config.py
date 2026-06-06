@@ -16,14 +16,13 @@ import os
 #   Mac/Linux:  export FINMIND_TOKEN="你的token"
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
-# 全域請求節流：跨「所有並行緒」的最小請求間隔秒數（取代舊的逐次 sleep）。
-# 免費 token 上限為 600 次/小時；短時間過量會觸發 402/429，由下方退避機制接手。
-FINMIND_MIN_INTERVAL = 0.12
-# 逐檔深掃的並行緒數（有 token 建議 4；無 token 或常被限流時可設 1 退回序列）。
-FINMIND_WORKERS = 4
-# 被限流時的退避重試次數與基礎等待秒數
-FINMIND_MAX_RETRY = 4
-FINMIND_BACKOFF = 8
+# --- FinMind 限流防護（避免短時間大量請求觸發 HTTP 402/429）---
+# 免費 token 上限約 600 次/小時，且短時間爆量易被擋；預設採最保守設定。
+FINMIND_WORKERS = 1                        # 逐檔深掃並行緒數（1＝序列，最不易觸發限流）
+FINMIND_MIN_INTERVAL = 1.0                 # 跨所有並行緒的最小請求間隔（秒）
+FINMIND_MAX_RETRIES = 3                    # 遇限流（402/429）時的最大重試次數
+FINMIND_BACKOFF_SECONDS = [60, 180, 300]   # 第 1/2/3 次重試前的等待秒數（不足則沿用最後一個）
+FINMIND_STOP_ON_RATE_LIMIT = False         # True＝一遇限流即停止整個掃描；False＝只略過該股、繼續
 
 # ---------------------------------------------------------------------------
 # 2. 路徑
@@ -103,3 +102,22 @@ TOP_SUBLIST_N = 5     # 四個子榜各取前幾名
 
 # 前瞻性欄位的統一標記文字（這些資料免費源取不到，需付費資料庫或賣方報告）
 PAID_PLACEHOLDER = "需付費資料源"
+
+# ---------------------------------------------------------------------------
+# 10. 安全模式（降低 FinMind 限流風險）
+# ---------------------------------------------------------------------------
+# True 時套用最保守設定，最不易觸發 402/429（適合免費 token、雲端或第一次跑）。
+# Streamlit 側邊欄亦提供勾選；CLI 可加 --no-safe 關閉。
+SAFE_MODE = True
+
+
+def apply_safe_mode():
+    """套用保守參數：單緒、請求間隔 ≥1 秒、深掃上限 100。可重複呼叫（idempotent）。"""
+    global FINMIND_WORKERS, FINMIND_MIN_INTERVAL, MAX_DEEP_SCAN
+    FINMIND_WORKERS = 1
+    FINMIND_MIN_INTERVAL = max(FINMIND_MIN_INTERVAL, 1.0)
+    MAX_DEEP_SCAN = 100 if not MAX_DEEP_SCAN else min(MAX_DEEP_SCAN, 100)
+
+
+if SAFE_MODE:
+    apply_safe_mode()

@@ -15,6 +15,7 @@
 import os
 import json
 import time
+import logging
 import threading
 import datetime as dt
 
@@ -46,6 +47,14 @@ class WAFBlocked(Exception):
     """資料來源防火牆（WAF）以非台灣 IP 回傳攔截頁（HTTP 200 但非 JSON）。"""
 
 
+class RateLimitError(Exception):
+    """FinMind 重試後仍達流量上限（HTTP 402/429）。讓上層只略過該股、不中斷整體。"""
+
+
+# 資料層診斷 log：限流重試／略過以 warning 顯示（預設可見）；
+# 「cache hit／fetch api」等高頻來源標記以 debug 顯示（預設安靜，需要時設 DEBUG 才看）。
+_logger = logging.getLogger("finmind")
+
 # 雲端攔截頁的特徵字串（命中即視為被 WAF 阻擋，不再重試）。
 _WAF_MARKERS = ("FOR SECURITY REASONS", "安全性考量", "CAN NOT BE ACCESSED")
 
@@ -62,6 +71,12 @@ def _rate_limit():
         if wait > 0:
             time.sleep(wait)
         _last_request_at[0] = time.monotonic()
+
+
+def _backoff_seconds(attempt: int) -> int:
+    """第 attempt 次重試前的等待秒數；超出清單長度則沿用最後一個。"""
+    waits = config.FINMIND_BACKOFF_SECONDS
+    return waits[attempt] if attempt < len(waits) else waits[-1]
 
 
 # ===========================================================================
@@ -343,43 +358,67 @@ def _finmind_raw(dataset: str, data_id: str = None,
     if config.FINMIND_TOKEN:
         params["token"] = config.FINMIND_TOKEN
 
-    wait = config.FINMIND_BACKOFF
+    did = data_id or "-"
     last_err = "未知原因"
-    for attempt in range(config.FINMIND_MAX_RETRY):
+    rate_limited = False
+    # 共 1 次首抓 + 最多 FINMIND_MAX_RETRIES 次重試。
+    for attempt in range(config.FINMIND_MAX_RETRIES + 1):
         try:
-            _rate_limit()  # 全域節流：跨並行緒控制請求速率（取代逐次 sleep）
+            _rate_limit()  # 全域節流：跨並行緒控制請求速率（每次請求至少間隔 MIN_INTERVAL）
             r = _session.get(FINMIND, params=params, timeout=40)
             if r.status_code == 200:
-                return r.json().get("data", [])  # 乾淨 200：可能為空，但屬「真的沒資料」，可快取
-            # 402 / 429：流量限制 → 退避重試
+                if attempt > 0:
+                    _logger.warning("FinMind 重試成功：%s %s", did, dataset)
+                return r.json().get("data", [])  # 乾淨 200：可能為空（真的沒資料）
+            # 402 / 429（或訊息含 limit／upper limit）→ 流量限制：退避後重試
             if r.status_code in (402, 429) or "limit" in r.text.lower():
+                rate_limited = True
                 last_err = f"限流 HTTP {r.status_code}"
-                print(f"  ⚠ FinMind 限流，{wait}s 後重試（{attempt+1}/{config.FINMIND_MAX_RETRY}）")
-                time.sleep(wait)
-                wait *= 2
-                continue
+                if attempt < config.FINMIND_MAX_RETRIES:
+                    wait = _backoff_seconds(attempt)
+                    _logger.warning(
+                        "FinMind 限流 %s：dataset=%s data_id=%s，等待 %d 秒後重試 %d/%d",
+                        r.status_code, dataset, did, wait, attempt + 1, config.FINMIND_MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
+                break  # 重試用盡
             r.raise_for_status()
         except requests.RequestException as e:
             last_err = str(e)
-            print(f"  ⚠ FinMind 連線錯誤：{e}，{wait}s 後重試")
-            time.sleep(wait)
-            wait *= 2
-    # 重試耗盡才拋例外：讓上層（逐檔迴圈 / 清單抓取）能區分「失敗」與「真的沒資料」，
-    # 避免把限流造成的空結果誤存進快取而卡住一整天。
+            if attempt < config.FINMIND_MAX_RETRIES:
+                wait = _backoff_seconds(attempt)
+                _logger.warning("FinMind 連線錯誤：%s，等待 %d 秒後重試 %d/%d",
+                                e, wait, attempt + 1, config.FINMIND_MAX_RETRIES)
+                time.sleep(wait)
+                continue
+            break  # 重試用盡
+    # 重試用盡才拋例外（上層只略過該股、不寫快取、不中斷整體）。
+    # 限流與其他錯誤用不同例外型別，讓上層能給出更清楚的訊息。
+    if rate_limited:
+        raise RateLimitError(
+            f"FinMind 重試後仍達流量限制（dataset={dataset} data_id={did}）：{last_err}")
     raise RuntimeError(
-        f"FinMind 抓取失敗（dataset={params.get('dataset')} "
-        f"data_id={params.get('data_id', '-')}）：{last_err}")
+        f"FinMind 抓取失敗（dataset={dataset} data_id={did}）：{last_err}")
 
 
 # ---- 逐檔當日快取：相同股號＋資料集在 CACHE_TTL_DAYS 內不重抓 ----
 def _finmind_cached(name: str, builder):
     """name 為快取檔名；builder 為實際抓取並回傳 DataFrame 的函式。
-    builder 失敗（拋例外）時不會寫入快取，交由上層處理。"""
+
+    快取規則（避免壞資料污染）：
+      - 當日快取存在 → 直接用，不打 API（cache hit）。
+      - builder 失敗（限流／連線錯誤）會拋例外 → 不寫快取，交由上層略過。
+      - 抓到空資料 → 不寫快取，也不覆蓋既有檔（保留先前可能可用的舊資料）。
+      - 只有成功且非空才寫入快取。
+    """
     cached = _load_cache_df(name)
     if cached is not None:
+        _logger.debug("cache hit: %s", name)
         return cached
+    _logger.debug("fetch api: %s", name)
     df = builder()
-    _save_cache_df(df, name)
+    if df is not None and not df.empty:
+        _save_cache_df(df, name)
     return df
 
 
