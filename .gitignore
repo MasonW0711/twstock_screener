@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit secrets (never commit tokens)
+.streamlit/secrets.toml
+
+# Runtime data (keep the folders via .gitkeep, ignore their contents)
+cache/*
+!cache/.gitkeep
+output/*
+!output/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
