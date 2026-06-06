@@ -16,8 +16,11 @@ import os
 #   Mac/Linux:  export FINMIND_TOKEN="你的token"
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 
-# 每次 FinMind 呼叫之間的間隔秒數（避免觸發限流；有付費 token 可調小）
-FINMIND_SLEEP = 0.55
+# 全域請求節流：跨「所有並行緒」的最小請求間隔秒數（取代舊的逐次 sleep）。
+# 免費 token 上限為 600 次/小時；短時間過量會觸發 402/429，由下方退避機制接手。
+FINMIND_MIN_INTERVAL = 0.12
+# 逐檔深掃的並行緒數（有 token 建議 4；無 token 或常被限流時可設 1 退回序列）。
+FINMIND_WORKERS = 4
 # 被限流時的退避重試次數與基礎等待秒數
 FINMIND_MAX_RETRY = 4
 FINMIND_BACKOFF = 8

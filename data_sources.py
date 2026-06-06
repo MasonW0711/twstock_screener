@@ -15,6 +15,7 @@
 import os
 import json
 import time
+import threading
 import datetime as dt
 
 import requests
@@ -39,6 +40,28 @@ HEADERS = {
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
+
+
+class WAFBlocked(Exception):
+    """資料來源防火牆（WAF）以非台灣 IP 回傳攔截頁（HTTP 200 但非 JSON）。"""
+
+
+# 雲端攔截頁的特徵字串（命中即視為被 WAF 阻擋，不再重試）。
+_WAF_MARKERS = ("FOR SECURITY REASONS", "安全性考量", "CAN NOT BE ACCESSED")
+
+
+# 全域請求節流：跨所有並行緒，確保「請求啟動」之間至少間隔 FINMIND_MIN_INTERVAL 秒。
+# 鎖只在記錄時間戳時短暫持有；實際網路 I/O 仍可在各緒間重疊。
+_rate_lock = threading.Lock()
+_last_request_at = [0.0]
+
+
+def _rate_limit():
+    with _rate_lock:
+        wait = config.FINMIND_MIN_INTERVAL - (time.monotonic() - _last_request_at[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at[0] = time.monotonic()
 
 
 # ===========================================================================
@@ -144,11 +167,16 @@ def _get_json(url: str, retries: int = 3):
             r = _session.get(url, timeout=40, verify=verify)
             status = r.status_code
             r.raise_for_status()
+            # WAF 攔截頁（HTTP 200 但內容是封鎖說明）→ 立即放棄，重試無意義。
+            text = r.text or ""
+            if any(m in text for m in _WAF_MARKERS):
+                raise WAFBlocked(
+                    f"資料來源防火牆（WAF）以非台灣 IP 阻擋：{url}（HTTP {status}）")
             # 不完全信任 content-type：有些來源把合法 JSON 標成 text/html。
             try:
                 return r.json()
             except ValueError:
-                snippet = (r.text or "")[:200].replace("\n", " ")
+                snippet = text[:200].replace("\n", " ")
                 last_err = "回應非 JSON"
         except requests.exceptions.SSLError as e:
             last_err = f"SSL 憑證驗證失敗：{e}"
@@ -316,24 +344,43 @@ def _finmind_raw(dataset: str, data_id: str = None,
         params["token"] = config.FINMIND_TOKEN
 
     wait = config.FINMIND_BACKOFF
+    last_err = "未知原因"
     for attempt in range(config.FINMIND_MAX_RETRY):
         try:
+            _rate_limit()  # 全域節流：跨並行緒控制請求速率（取代逐次 sleep）
             r = _session.get(FINMIND, params=params, timeout=40)
             if r.status_code == 200:
-                time.sleep(config.FINMIND_SLEEP)
-                return r.json().get("data", [])
+                return r.json().get("data", [])  # 乾淨 200：可能為空，但屬「真的沒資料」，可快取
             # 402 / 429：流量限制 → 退避重試
             if r.status_code in (402, 429) or "limit" in r.text.lower():
+                last_err = f"限流 HTTP {r.status_code}"
                 print(f"  ⚠ FinMind 限流，{wait}s 後重試（{attempt+1}/{config.FINMIND_MAX_RETRY}）")
                 time.sleep(wait)
                 wait *= 2
                 continue
             r.raise_for_status()
         except requests.RequestException as e:
+            last_err = str(e)
             print(f"  ⚠ FinMind 連線錯誤：{e}，{wait}s 後重試")
             time.sleep(wait)
             wait *= 2
-    return []
+    # 重試耗盡才拋例外：讓上層（逐檔迴圈 / 清單抓取）能區分「失敗」與「真的沒資料」，
+    # 避免把限流造成的空結果誤存進快取而卡住一整天。
+    raise RuntimeError(
+        f"FinMind 抓取失敗（dataset={params.get('dataset')} "
+        f"data_id={params.get('data_id', '-')}）：{last_err}")
+
+
+# ---- 逐檔當日快取：相同股號＋資料集在 CACHE_TTL_DAYS 內不重抓 ----
+def _finmind_cached(name: str, builder):
+    """name 為快取檔名；builder 為實際抓取並回傳 DataFrame 的函式。
+    builder 失敗（拋例外）時不會寫入快取，交由上層處理。"""
+    cached = _load_cache_df(name)
+    if cached is not None:
+        return cached
+    df = builder()
+    _save_cache_df(df, name)
+    return df
 
 
 def _recent_start(days: int) -> str:
@@ -341,36 +388,37 @@ def _recent_start(days: int) -> str:
 
 
 def fetch_price_history(stock_id: str) -> pd.DataFrame:
-    data = _finmind_raw("TaiwanStockPrice", stock_id,
-                        _recent_start(int(config.PRICE_HISTORY_DAYS * 1.6)))
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df = df.sort_values("date").reset_index(drop=True)
-    return df
+    def build():
+        data = _finmind_raw("TaiwanStockPrice", stock_id,
+                            _recent_start(int(config.PRICE_HISTORY_DAYS * 1.6)))
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.sort_values("date").reset_index(drop=True)
+        return df
+    return _finmind_cached(f"fm_price_{stock_id}.parquet", build)
 
 
 def fetch_month_revenue(stock_id: str) -> pd.DataFrame:
-    data = _finmind_raw("TaiwanStockMonthRevenue", stock_id, _recent_start(900))
-    return pd.DataFrame(data)
+    return _finmind_cached(f"fm_rev_{stock_id}.parquet", lambda: pd.DataFrame(
+        _finmind_raw("TaiwanStockMonthRevenue", stock_id, _recent_start(900))))
 
 
 def fetch_income_statement(stock_id: str) -> pd.DataFrame:
-    data = _finmind_raw("TaiwanStockFinancialStatements", stock_id, _recent_start(1500))
-    return pd.DataFrame(data)
+    return _finmind_cached(f"fm_income_{stock_id}.parquet", lambda: pd.DataFrame(
+        _finmind_raw("TaiwanStockFinancialStatements", stock_id, _recent_start(1500))))
 
 
 def fetch_balance_sheet(stock_id: str) -> pd.DataFrame:
-    data = _finmind_raw("TaiwanStockBalanceSheet", stock_id, _recent_start(1500))
-    return pd.DataFrame(data)
+    return _finmind_cached(f"fm_bs_{stock_id}.parquet", lambda: pd.DataFrame(
+        _finmind_raw("TaiwanStockBalanceSheet", stock_id, _recent_start(1500))))
 
 
 def fetch_institutional(stock_id: str) -> pd.DataFrame:
-    data = _finmind_raw("TaiwanStockInstitutionalInvestorsBuySell",
-                        stock_id, _recent_start(45))
-    return pd.DataFrame(data)
+    return _finmind_cached(f"fm_inst_{stock_id}.parquet", lambda: pd.DataFrame(
+        _finmind_raw("TaiwanStockInstitutionalInvestorsBuySell",
+                     stock_id, _recent_start(45))))
 
 
 def fetch_margin(stock_id: str) -> pd.DataFrame:
-    data = _finmind_raw("TaiwanStockMarginPurchaseShortSale",
-                        stock_id, _recent_start(20))
-    return pd.DataFrame(data)
+    return _finmind_cached(f"fm_margin_{stock_id}.parquet", lambda: pd.DataFrame(
+        _finmind_raw("TaiwanStockMarginPurchaseShortSale", stock_id, _recent_start(20))))

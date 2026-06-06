@@ -15,6 +15,8 @@
 
 import sys
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 
 import config
@@ -82,26 +84,28 @@ def run_screen(max_deep=None, log=print):
     log(f"   通過流動性、進入深掃：{len(stage1)} 檔")
 
     pe_ind = sc.industry_pe_table(snap, uni)
-    rows, passed = [], 0
     total = len(stage1)
-    for n, (_, s) in enumerate(stage1.iterrows(), start=1):
+    log(f"   並行深掃（{config.FINMIND_WORKERS} 緒）…")
+
+    # 逐檔處理抽成純函式，方便並行；不在工作緒呼叫 log（Streamlit 僅主緒安全），
+    # 而是回傳結果與訊息，由主緒在 future 完成時統一輸出。
+    def screen_one(s):
         sid = s["stock_id"]
         try:
             price = ds.fetch_price_history(sid)
             tech = sc.compute_technical(price)
             if tech is None:
-                continue
+                return False, None, None
             if tech["dist_from_52w_high"] is None or tech["dist_from_52w_high"] > config.MAX_DIST_FROM_52W_HIGH:
-                continue
+                return False, None, None
             if not sc.technical_pass(tech):
-                continue
+                return False, None, None
             income = ds.fetch_income_statement(sid)
             bs = ds.fetch_balance_sheet(sid)
             rev = ds.fetch_month_revenue(sid)
             fund = sc.compute_fundamentals(income, bs, rev)
             if not sc.fundamentals_pass(fund):
-                continue
-            passed += 1
+                return False, None, None
             inst = sc.compute_institutional(ds.fetch_institutional(sid))
             theme = themes.tag_themes(sid, s.get("industry", "") or "")
             pe = s.get("pe")
@@ -109,11 +113,25 @@ def run_screen(max_deep=None, log=print):
             base = {"close": s.get("close"), "pe": pe, "industry": s.get("industry", "")}
             metric_row = dict(base, **fund, **tech, **inst, theme=theme, pe_below_industry=pe_below)
             score, rating = sc.score_and_rate(metric_row)
-            rows.append(build_row(sid, s["name"], base, fund, tech, inst,
-                                  theme, pe_below, score, rating))
-            log(f"③ {n}/{total} {sid} {s['name']} ✓ 入選 評分{score} {rating}")
+            row = build_row(sid, s["name"], base, fund, tech, inst,
+                            theme, pe_below, score, rating)
+            return True, row, f"{sid} {s['name']} ✓ 入選 評分{score} {rating}"
         except Exception as e:
-            log(f"③ {n}/{total} {sid} 錯誤略過：{e}")
+            return False, None, f"{sid} 錯誤略過：{e}"
+
+    rows, passed, done = [], 0, 0
+    with ThreadPoolExecutor(max_workers=config.FINMIND_WORKERS) as ex:
+        futures = [ex.submit(screen_one, s) for _, s in stage1.iterrows()]
+        for fut in as_completed(futures):
+            done += 1
+            ok, row, msg = fut.result()
+            if ok:
+                passed += 1
+                rows.append(row)
+            if msg:                       # 入選或錯誤：逐筆顯示
+                log(f"③ {done}/{total} {msg}")
+            elif done % 25 == 0:          # 一般淘汰：每 25 檔回報一次進度，避免洗版
+                log(f"③ {done}/{total} 已處理…")
 
     if not rows:
         return None, None, None, passed
