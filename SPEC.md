@@ -29,9 +29,12 @@
 | 逐檔損益表 | FinMind `TaiwanStockFinancialStatements` | `api.finmindtrade.com` | **逐檔** | ✅ 可用 |
 | 逐檔資產負債表 | FinMind `TaiwanStockBalanceSheet` | `api.finmindtrade.com` | **逐檔** | ✅ 可用 |
 | 逐檔三大法人買賣超 | FinMind `TaiwanStockInstitutionalInvestorsBuySell` | `api.finmindtrade.com` | **逐檔** | ✅ 可用 |
-| 逐檔融資融券（目前未進主流程） | FinMind `TaiwanStockMarginPurchaseShortSale` | `api.finmindtrade.com` | **逐檔** | ✅ 可用 |
+| 逐檔融資融券 | FinMind `TaiwanStockMarginPurchaseShortSale` | `api.finmindtrade.com` | **逐檔** | ✅ 可用 |
 
 **金鑰**：`FINMIND_TOKEN`（環境變數，或 Streamlit secrets）。無 token 可跑但流量上限極低。
+
+資料來源層會針對每個外部資料集、快取與 seed 檢查必要欄位；若來源 API schema 改變或本地資料不完整，
+流程會回報缺少欄位，而不是默默產生偏差結果。
 
 ---
 
@@ -74,7 +77,8 @@ output/           Excel 輸出
 4. `fetch_income_statement` + `fetch_balance_sheet` + `fetch_month_revenue` → `compute_fundamentals`。
 5. `fundamentals_pass`（全部硬門檻）→ 不過跳過；過則 `passed += 1`。
 6. `fetch_institutional` → 法人加分；`tag_themes` 題材；PE vs 產業中位數。
-7. `score_and_rate` → 評分評等 → `build_row`。
+7. `fetch_margin` → 計算近 5 日融資餘額增幅；預設列入風險，`EXCLUDE_MARGIN_SURGE=True` 時排除。
+8. `score_and_rate` → 評分評等 → `build_row`。
 
 > 設計意圖：先用便宜的技術面 gate 過濾，才抓較貴的財報三表，減少 FinMind 呼叫。
 
@@ -100,6 +104,9 @@ output/           Excel 輸出
 - `EXCLUDE_BEAR_ALIGNMENT = True`：長空排列（MA20<MA60<MA120）排除。
 - `REQUIRE_PULLBACK_ZONE = False`：是否強制要求回檔區（預設僅加分）。
 - MA 參數：`MA_SHORT=20 / MA_MID=60 / MA_LONG=120 / MA_YEAR=240`；`PRICE_HISTORY_DAYS=400`。
+- `MARGIN_SURGE_5D = 0.20`：近 5 日融資餘額增幅警示門檻。
+- `EXCLUDE_MARGIN_SURGE = False`：預設只列風險；設為 True 時，融資暴增者排除。
+- Streamlit 側邊欄可調整 PE 硬門檻、融資暴增門檻/排除、停損緩衝等進階風險設定。
 
 ### 法人 / 估值（加分，非硬門檻）
 - `INST_LOOKBACK_DAYS = 20`：法人買賣超回看交易日。
@@ -123,7 +130,8 @@ output/           Excel 輸出
 - `fair_price_proxy`＝`ttm_eps × 產業PE中位數`（EPS>0、0<PE中位數≤200）；`upside_proxy`＝合理價÷現價−1。
 - `peg_proxy`＝`pe ÷ (eps_yoy_ttm×100)`（PE>0、`eps_yoy_ttm ≥ PEG_MIN_GROWTH=0.02`）。
 
-**參考位階**（`reference_levels`，純技術）：建議買進區間＝季線~月線；停損＝跌破年線（無則半年線）。
+**參考位階**（`reference_levels`，純技術）：建議買進區間＝季線~月線；停損優先使用
+`STOP_BUFFER_BELOW_MID` 計算的季線下方緩衝（預設 6%），無季線時才退回年線/半年線。
 
 ---
 
@@ -134,10 +142,11 @@ output/           Excel 輸出
 | **當日快取** `cache/` | `snapshot.parquet`, `universe.parquet` | 全市場批次 | `CACHE_TTL_DAYS=1` |
 | **當日快取** `cache/` | `fm_<dataset>_<股號>.parquet` | **逐檔 FinMind（價格/財報/法人）** | `CACHE_TTL_DAYS=1` |
 | **即時抓取** | 直接打 API | 全部 | — |
-| **內建快照** `seed/` | `snapshot.parquet`, `universe.parquet` | 僅全市場批次 | 由 `make_seed.py` 手動更新 |
+| **內建快照** `seed/` | `snapshot.parquet`, `universe.parquet`, `metadata.json` | 僅全市場批次 | 由 `make_seed.py` 手動更新 |
 
 取用優先序（全市場）：**當日快取 → 即時抓取 → seed 後備**（`get_market_snapshot` / `get_universe`）。
 逐檔：**當日快取 → 即時抓取**（成功才寫快取；限流/連線失敗會拋例外，不污染快取）。
+seed 新鮮度由 `seed/metadata.json` 記錄，不依賴檔案 mtime，避免部署平台改變檔案時間後誤判資料日期。
 
 > 同一交易日重跑（含 Streamlit 調參數）逐檔資料全走快取，近乎即時。隔交易日自動失效。
 
@@ -145,11 +154,14 @@ output/           Excel 輸出
 
 ## 8. 輸出
 
-- Excel：`output/逢低布局選股_YYYYMMDD.xlsx`。
+- Excel：`output/逢低布局選股_YYYYMMDD_HHMMSS.xlsx`，避免同日重跑覆蓋舊報告。
   - 工作表：`前20名逢低布局`、`最佳成長股TOP5`、`最佳價值股TOP5`、`最佳AI題材股TOP5`、`最有機會創新高TOP5`、`參數與免責`。
   - 主表 24 欄（`excel_report.COLUMNS`）：基本資訊（代號/名稱/產業/股價/成交量/PE/ROE/負債比）＋免費替代指標（近四季EPS、EPS年增率、近3/6/12月營收YoY、營收是否加速、估算合理價、估算上漲空間、PEG替代值）＋法人/題材/風險/買進停損區間/評分/評等。`估算合理價、估算上漲空間、PEG替代值` 以淡黃底標記為「機械式估算」。
   - 免費替代指標公式見 §6；資料不足之欄位顯示「資料不足」（`config.NA_TEXT`）。
+  - `參數與免責` 工作表包含本次資料品質摘要：全市場有效檔數、進入深掃檔數、通過技術面/基本面檔數、略過原因與錯誤原因。
 - Streamlit：主表 + 四子榜分頁 + 依評等/題材過濾 + 下載 Excel。
+  - Streamlit 每次執行會建立單次使用的 `ScreenConfig` 設定快照，不直接改寫全域 `config.py` 門檻，避免 rerun 或多 session 互相污染。
+  - Streamlit 下載 Excel 時使用記憶體產生檔案，不寫入 `output/`；CLI 仍輸出實體檔。
 - 子榜定義：成長（_rev_yoy 降冪）、價值（_pe 升冪）、AI（命中 `AI_CORE_THEMES`）、創新高（_dist52w 升冪），各取 `TOP_SUBLIST_N=5`。
 
 ---
@@ -190,3 +202,6 @@ python make_seed.py               # 本機更新雲端後備 seed/
 ```
 
 依賴：`requests, pandas, openpyxl, pyarrow, streamlit`。
+
+CI：GitHub Actions 會在 push / pull request 時執行 `python -m compileall -q .` 與
+`python -m unittest discover -s tests -v`。

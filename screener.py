@@ -7,12 +7,10 @@
 本模組會先「去累計」還原成單季數字，才能正確判斷單季 EPS 與單季毛利率。
 """
 
-import math
 import numpy as np
 import pandas as pd
 
 import config
-import themes
 
 
 # ===========================================================================
@@ -58,7 +56,8 @@ def _bs_latest(bs_df: pd.DataFrame, type_name: str, n_ago: int = 0):
 # ===========================================================================
 # 基本面指標
 # ===========================================================================
-def compute_fundamentals(income_df, bs_df, revenue_df):
+def compute_fundamentals(income_df, bs_df, revenue_df, cfg=None):
+    cfg = cfg or config
     m = {}
 
     eps_q = _income_series(income_df, "EPS")
@@ -79,7 +78,7 @@ def compute_fundamentals(income_df, bs_df, revenue_df):
     m["gross_margin_prev"] = gms[-2][1] if len(gms) >= 2 else None
     if m["gross_margin_latest"] is not None and m["gross_margin_prev"] is not None:
         m["gross_margin_drop_pp"] = m["gross_margin_prev"] - m["gross_margin_latest"]
-        m["gross_margin_ok"] = m["gross_margin_drop_pp"] <= config.MAX_GROSS_MARGIN_DROP_PP
+        m["gross_margin_ok"] = m["gross_margin_drop_pp"] <= cfg.MAX_GROSS_MARGIN_DROP_PP
     else:
         m["gross_margin_drop_pp"] = None
         m["gross_margin_ok"] = False
@@ -94,13 +93,13 @@ def compute_fundamentals(income_df, bs_df, revenue_df):
         m["roe"] = ni_ttm / avg_eq if avg_eq else None
     else:
         m["roe"] = None
-    m["roe_ok"] = m["roe"] is not None and m["roe"] > config.MIN_ROE
+    m["roe_ok"] = m["roe"] is not None and m["roe"] > cfg.MIN_ROE
 
     # 負債比
     liab = _bs_latest(bs_df, "Liabilities", 0)
     assets = _bs_latest(bs_df, "TotalAssets", 0)
     m["debt_ratio"] = (liab / assets) if (liab is not None and assets) else None
-    m["debt_ratio_ok"] = m["debt_ratio"] is not None and m["debt_ratio"] < config.MAX_DEBT_RATIO
+    m["debt_ratio_ok"] = m["debt_ratio"] is not None and m["debt_ratio"] < cfg.MAX_DEBT_RATIO
 
     # 近三年無虧損（年度淨利 = 該年四個單季淨利加總，需該年四季齊全）
     ni_year = {}
@@ -108,14 +107,14 @@ def compute_fundamentals(income_df, bs_df, revenue_df):
         if v is not None:
             ni_year.setdefault(y, {})[q] = v
     full = {y: sum(qs.values()) for y, qs in ni_year.items() if len(qs) == 4}
-    full_years = sorted(full.keys())[-config.NO_LOSS_YEARS:]
-    m["no_loss_years"] = (len(full_years) >= config.NO_LOSS_YEARS
+    full_years = sorted(full.keys())[-cfg.NO_LOSS_YEARS:]
+    m["no_loss_years"] = (len(full_years) >= cfg.NO_LOSS_YEARS
                           and all(full[y] > 0 for y in full_years))
     m["checked_years"] = full_years
 
     # 近一年（TTM）營收年增率
     m["rev_yoy"] = _revenue_ttm_yoy(revenue_df)
-    m["rev_yoy_ok"] = m["rev_yoy"] is not None and m["rev_yoy"] > config.MIN_REVENUE_YOY
+    m["rev_yoy_ok"] = m["rev_yoy"] is not None and m["rev_yoy"] > cfg.MIN_REVENUE_YOY
 
     # ---- 免費替代指標（公開歷史資料機械式計算，非預估、非投資建議）----
     m.update(_eps_free_metrics(eps_q))
@@ -176,28 +175,40 @@ def _revenue_free_metrics(revenue_df: pd.DataFrame, rev_yoy_ttm):
     return out
 
 
-def fundamentals_pass(m) -> bool:
-    checks = [
-        (not config.REQUIRE_LAST4Q_EPS_POSITIVE) or m["eps_last4q_positive"],
-        m["rev_yoy_ok"],
-        m["gross_margin_ok"],
-        m["roe_ok"],
-        m["debt_ratio_ok"],
-        m["no_loss_years"],
-    ]
-    return all(checks)
+def fundamentals_pass(m, cfg=None) -> bool:
+    return not fundamental_fail_reasons(m, cfg=cfg)
+
+
+def fundamental_fail_reasons(m, cfg=None) -> list:
+    """回傳基本面未通過原因，供流程統計與使用者提示。"""
+    cfg = cfg or config
+    reasons = []
+    if cfg.REQUIRE_LAST4Q_EPS_POSITIVE and not m["eps_last4q_positive"]:
+        reasons.append("最近四季EPS未全為正")
+    if not m["rev_yoy_ok"]:
+        reasons.append("營收年增率未達門檻或資料不足")
+    if not m["gross_margin_ok"]:
+        reasons.append("毛利率衰退超標或資料不足")
+    if not m["roe_ok"]:
+        reasons.append("ROE未達門檻或資料不足")
+    if not m["debt_ratio_ok"]:
+        reasons.append("負債比超標或資料不足")
+    if not m["no_loss_years"]:
+        reasons.append("近年獲利紀錄未達門檻或資料不足")
+    return reasons
 
 
 # ===========================================================================
 # 技術面指標
 # ===========================================================================
-def compute_technical(price_df: pd.DataFrame):
+def compute_technical(price_df: pd.DataFrame, cfg=None):
+    cfg = cfg or config
     t = {}
     if price_df.empty or "close" not in price_df.columns:
         return None
     close = price_df["close"].astype(float)
     high = price_df["max"].astype(float) if "max" in price_df.columns else close
-    if len(close) < config.MA_MID:
+    if len(close) < cfg.MA_MID:
         return None
 
     def ma(n):
@@ -205,10 +216,10 @@ def compute_technical(price_df: pd.DataFrame):
 
     last = close.iloc[-1]
     t["close"] = last
-    t["ma20"] = ma(config.MA_SHORT)
-    t["ma60"] = ma(config.MA_MID)
-    t["ma120"] = ma(config.MA_LONG)
-    t["ma240"] = ma(config.MA_YEAR)
+    t["ma20"] = ma(cfg.MA_SHORT)
+    t["ma60"] = ma(cfg.MA_MID)
+    t["ma120"] = ma(cfg.MA_LONG)
+    t["ma240"] = ma(cfg.MA_YEAR)
 
     window = min(len(high), 252)
     t["high_52w"] = high.tail(window).max()
@@ -234,27 +245,35 @@ def compute_technical(price_df: pd.DataFrame):
     return t
 
 
-def technical_pass(t) -> bool:
+def technical_pass(t, cfg=None) -> bool:
+    return not technical_fail_reasons(t, cfg=cfg)
+
+
+def technical_fail_reasons(t, cfg=None) -> list:
+    """回傳技術面未通過原因，供流程統計與使用者提示。"""
+    cfg = cfg or config
     if t is None:
-        return False
-    if config.EXCLUDE_BELOW_YEAR_LINE and t["below_year_line"]:
-        return False
-    if config.EXCLUDE_BEAR_ALIGNMENT and t["bear_alignment"]:
-        return False
-    if config.REQUIRE_PULLBACK_ZONE and not t["pullback_zone"]:
-        return False
-    return True
+        return ["技術資料不足"]
+    reasons = []
+    if cfg.EXCLUDE_BELOW_YEAR_LINE and t["below_year_line"]:
+        reasons.append("跌破年線")
+    if cfg.EXCLUDE_BEAR_ALIGNMENT and t["bear_alignment"]:
+        reasons.append("長空排列")
+    if cfg.REQUIRE_PULLBACK_ZONE and not t["pullback_zone"]:
+        reasons.append("不在回檔區")
+    return reasons
 
 
 # ===========================================================================
 # 法人 20 日買賣超
 # ===========================================================================
-def compute_institutional(inst_df: pd.DataFrame):
+def compute_institutional(inst_df: pd.DataFrame, cfg=None):
+    cfg = cfg or config
     out = {"foreign_net_lots": None, "trust_net_lots": None}
     if inst_df.empty:
         return out
     df = inst_df.copy()
-    dates = sorted(df["date"].unique())[-config.INST_LOOKBACK_DAYS:]
+    dates = sorted(df["date"].unique())[-cfg.INST_LOOKBACK_DAYS:]
     df = df[df["date"].isin(dates)]
     df["net"] = df["buy"].astype(float) - df["sell"].astype(float)
     fore = df[df["name"].isin(["Foreign_Investor", "Foreign_Dealer_Self"])]["net"].sum()
@@ -276,16 +295,17 @@ def compute_margin_surge(margin_df: pd.DataFrame):
 # ===========================================================================
 # 估值：產業平均本益比
 # ===========================================================================
-def industry_pe_table(snapshot: pd.DataFrame, universe: pd.DataFrame):
+def industry_pe_table(snapshot: pd.DataFrame, universe: pd.DataFrame, cfg=None):
+    cfg = cfg or config
     df = snapshot.copy()
     if "industry" not in df.columns:
         df = df.merge(universe[["stock_id", "industry"]], on="stock_id", how="left")
     df = df[df["pe"].notna() & (df["pe"] > 0) & (df["pe"] < 200)]
-    agg = "median" if config.INDUSTRY_PE_METHOD == "median" else "mean"
+    agg = "median" if cfg.INDUSTRY_PE_METHOD == "median" else "mean"
     return df.groupby("industry")["pe"].agg(agg).to_dict()
 
 
-def compute_valuation_proxies(ttm_eps, pe, industry_pe_median, current_price, eps_yoy_ttm):
+def compute_valuation_proxies(ttm_eps, pe, industry_pe_median, current_price, eps_yoy_ttm, cfg=None):
     """免費估值替代指標（機械式計算，非券商目標價／法人預估，非投資建議）。
 
     回 dict：
@@ -294,6 +314,7 @@ def compute_valuation_proxies(ttm_eps, pe, industry_pe_median, current_price, ep
       peg_proxy        = pe / (eps_yoy_ttm × 100)
     任一輸入不合格則對應值為 None。
     """
+    cfg = cfg or config
     out = {"fair_price_proxy": None, "upside_proxy": None, "peg_proxy": None}
 
     # 估算合理價：需 ttm_eps>0 且產業PE中位數有效（0<pe<=200）
@@ -305,7 +326,7 @@ def compute_valuation_proxies(ttm_eps, pe, industry_pe_median, current_price, ep
 
     # PEG 替代值：需 pe>0、eps 年增率>0 且不過小（避免分母過小失真）
     if (pe is not None and pe > 0 and eps_yoy_ttm is not None
-            and eps_yoy_ttm >= config.PEG_MIN_GROWTH):
+            and eps_yoy_ttm >= cfg.PEG_MIN_GROWTH):
         out["peg_proxy"] = pe / (eps_yoy_ttm * 100)
 
     return out
@@ -356,15 +377,19 @@ def score_and_rate(row) -> tuple:
     return score, rating
 
 
-def reference_levels(t):
+def reference_levels(t, cfg=None):
     """純技術參考位階（非投資建議）：買進參考區間、停損參考、回檔支撐。"""
+    cfg = cfg or config
     a20, a60, a120, a240 = t["ma20"], t["ma60"], t["ma120"], t["ma240"]
     if a20 and a60:
         lo, hi = sorted([a20, a60])
         buy_zone = f"{lo:.1f}–{hi:.1f}（季線~月線）"
     else:
         buy_zone = "—"
-    if a240:
+    if a60:
+        stop_level = a60 * (1 - cfg.STOP_BUFFER_BELOW_MID)
+        stop = f"{stop_level:.1f}（季線下方{cfg.STOP_BUFFER_BELOW_MID:.0%}）"
+    elif a240:
         stop = f"{a240:.1f}（跌破年線）"
     elif a120:
         stop = f"{a120:.1f}（跌破半年線）"
