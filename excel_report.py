@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Excel 多工作表輸出：主表、四個子榜、參數與資料來源說明。"""
 
+import io
 import datetime as dt
 import pandas as pd
 from openpyxl import Workbook
@@ -55,13 +56,35 @@ def _write_table(ws, df: pd.DataFrame, title: str):
     ws.freeze_panes = ws.cell(row=start + 1, column=1)
 
 
-def _write_notes(ws, params_used: dict, total_passed: int):
+def _format_counts(counts: dict, limit: int = 8):
+    if not counts:
+        return ["  無"]
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    lines = [f"  {name}：{count} 檔" for name, count in items]
+    if len(counts) > limit:
+        lines.append(f"  其他：{sum(counts.values()) - sum(count for _, count in items)} 檔")
+    return lines
+
+
+def _write_notes(ws, params_used: dict, total_passed: int, stats: dict = None):
     ws["A1"] = "篩選參數與資料來源說明"
     ws["A1"].font = _TITLE_FONT
+    stats = stats or {}
     lines = [
         "",
         f"產出時間：{dt.datetime.now():%Y-%m-%d %H:%M}",
         f"通過全部基本面硬門檻的個股數：{total_passed}",
+        f"最終入選並評分的個股數：{stats.get('selected_count', total_passed)}",
+        "",
+        "【本次資料品質摘要】",
+        f"  全市場有效個股：{stats.get('market_count', '未記錄')}",
+        f"  進入逐檔深掃：{stats.get('stage1_count', '未記錄')}",
+        f"  通過技術面與位階篩選：{stats.get('technical_pass_count', '未記錄')}",
+        f"  通過基本面硬門檻：{stats.get('fundamentals_pass_count', total_passed)}",
+        "  略過原因：",
+        *_format_counts(stats.get("skipped", {})),
+        "  錯誤原因：",
+        *_format_counts(stats.get("errors", {})),
         "",
         "【資料來源】（皆為免費公開資料）",
         "  價量/估值：證券交易所 OpenAPI、櫃買中心 OpenAPI（全市場批次）",
@@ -84,6 +107,10 @@ def _write_notes(ws, params_used: dict, total_passed: int):
         f"  負債比 < {params_used['debt']:.0%}",
         f"  近 {params_used['noloss']} 年無年度虧損",
         f"  日成交量 > {params_used['lots']:,} 張、距 52 週高 ≤ {params_used['dist']:.0%}",
+        f"  PE 必須低於產業基準：{params_used.get('pe_below', '否')}",
+        f"  近5日融資餘額增幅警示門檻：>{params_used.get('margin_surge', 0):.0%}"
+        f"（排除：{params_used.get('exclude_margin_surge', '否')}）",
+        f"  停損參考：季線下方 {params_used.get('stop_buffer', 0):.0%}",
         f"  排除跌破年線、長空排列",
         "",
         "【評等說明】",
@@ -101,18 +128,32 @@ def _write_notes(ws, params_used: dict, total_passed: int):
     ws.column_dimensions["A"].width = 80
 
 
-def write_report(main_df, sublists: dict, params_used: dict, total_passed: int):
+def build_workbook(main_df, sublists: dict, params_used: dict, total_passed: int,
+                   stats: dict = None, cfg=None):
+    cfg = cfg or config
     wb = Workbook()
     ws = wb.active
     ws.title = "前20名逢低布局"
-    _write_table(ws, main_df.head(config.TOP_N), f"恐慌殺盤逢低布局・前 {config.TOP_N} 名")
+    _write_table(ws, main_df.head(cfg.TOP_N), f"恐慌殺盤逢低布局・前 {cfg.TOP_N} 名")
 
     for name, df in sublists.items():
         w = wb.create_sheet(name)
         _write_table(w, df, name)
 
-    _write_notes(wb.create_sheet("參數與免責"), params_used, total_passed)
+    _write_notes(wb.create_sheet("參數與免責"), params_used, total_passed, stats)
+    return wb
 
-    path = f"{config.OUTPUT_DIR}/逢低布局選股_{dt.date.today():%Y%m%d}.xlsx"
+
+def write_report(main_df, sublists: dict, params_used: dict, total_passed: int, stats: dict = None, cfg=None):
+    wb = build_workbook(main_df, sublists, params_used, total_passed, stats=stats, cfg=cfg)
+    path = f"{config.OUTPUT_DIR}/逢低布局選股_{dt.datetime.now():%Y%m%d_%H%M%S}.xlsx"
     wb.save(path)
     return path
+
+
+def build_report_bytes(main_df, sublists: dict, params_used: dict, total_passed: int,
+                       stats: dict = None, cfg=None) -> bytes:
+    wb = build_workbook(main_df, sublists, params_used, total_passed, stats=stats, cfg=cfg)
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()

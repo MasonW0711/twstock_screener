@@ -17,6 +17,7 @@ import json
 import time
 import logging
 import threading
+import warnings
 import datetime as dt
 
 import requests
@@ -25,8 +26,8 @@ import pandas as pd
 
 import config
 
-# 部分官方端點（如櫃買）憑證鏈不完整，必要時會以 verify=False 重試；關閉相關警告噪音。
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# 部分官方端點（如櫃買）憑證鏈不完整，必要時會以 verify=False 重試；
+# fallback 僅限 TPEX，且會記錄 warning。
 
 TWSE = "https://openapi.twse.com.tw/v1"
 TPEX = "https://www.tpex.org.tw/openapi/v1"
@@ -65,17 +66,19 @@ _rate_lock = threading.Lock()
 _last_request_at = [0.0]
 
 
-def _rate_limit():
+def _rate_limit(cfg=None):
+    cfg = cfg or config
     with _rate_lock:
-        wait = config.FINMIND_MIN_INTERVAL - (time.monotonic() - _last_request_at[0])
+        wait = cfg.FINMIND_MIN_INTERVAL - (time.monotonic() - _last_request_at[0])
         if wait > 0:
             time.sleep(wait)
         _last_request_at[0] = time.monotonic()
 
 
-def _backoff_seconds(attempt: int) -> int:
+def _backoff_seconds(attempt: int, cfg=None) -> int:
     """第 attempt 次重試前的等待秒數；超出清單長度則沿用最後一個。"""
-    waits = config.FINMIND_BACKOFF_SECONDS
+    cfg = cfg or config
+    waits = cfg.FINMIND_BACKOFF_SECONDS
     return waits[attempt] if attempt < len(waits) else waits[-1]
 
 
@@ -86,6 +89,15 @@ def _cache_path(name: str) -> str:
     return os.path.join(config.CACHE_DIR, name)
 
 
+def _cache_candidates(name: str):
+    path = _cache_path(name)
+    if path.endswith(".parquet"):
+        return [path, path.replace(".parquet", ".csv")]
+    if path.endswith(".csv"):
+        return [path, path.replace(".csv", ".parquet")]
+    return [path]
+
+
 def _is_fresh(path: str) -> bool:
     if not os.path.exists(path):
         return False
@@ -94,15 +106,15 @@ def _is_fresh(path: str) -> bool:
 
 
 def _load_cache_df(name: str):
-    path = _cache_path(name)
-    if _is_fresh(path):
+    for path in _cache_candidates(name):
+        if not _is_fresh(path):
+            continue
         try:
-            return pd.read_parquet(path)
+            if path.endswith(".parquet"):
+                return pd.read_parquet(path)
+            return pd.read_csv(path, dtype={"stock_id": str})
         except Exception:
-            try:
-                return pd.read_csv(path, dtype={"stock_id": str})
-            except Exception:
-                return None
+            continue
     return None
 
 
@@ -114,11 +126,20 @@ def _save_cache_df(df: pd.DataFrame, name: str):
         df.to_csv(path.replace(".parquet", ".csv"), index=False)
 
 
+def _validate_snapshot_df(df: pd.DataFrame, source: str):
+    _require_columns(df, ["stock_id", "name", "close", "lots", "pe", "pb", "yield_pct"], source, allow_empty=False)
+
+
+def _validate_universe_df(df: pd.DataFrame, source: str):
+    _require_columns(df, ["stock_id", "name", "industry", "board"], source, allow_empty=False)
+
+
 # ===========================================================================
 # 內建快照（seed）：當雲端主機被資料來源 WAF 阻擋、無法即時抓取時的後備資料。
 # 由 `python make_seed.py` 在本機產生並 commit 進 repo（見 seed/）。
 # ===========================================================================
 SEED_DIR = os.path.join(config.BASE_DIR, "seed")
+SEED_METADATA = os.path.join(SEED_DIR, "metadata.json")
 
 
 def _seed_path(name: str) -> str:
@@ -138,13 +159,39 @@ def _load_seed_df(name: str):
     return None
 
 
+def _load_seed_metadata() -> dict:
+    try:
+        with open(SEED_METADATA, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _seed_date(name: str) -> str:
-    """內建快照檔案的最後更新日期字串（給使用者參考資料新鮮度）。"""
-    for path in (_seed_path(name), _seed_path(name).replace(".parquet", ".csv")):
-        if os.path.exists(path):
-            ts = os.path.getmtime(path)
-            return dt.date.fromtimestamp(ts).isoformat()
+    """內建快照 metadata 的產生日期字串（給使用者參考資料新鮮度）。"""
+    meta = _load_seed_metadata()
+    if name.startswith("snapshot"):
+        value = meta.get("snapshot_generated_at") or meta.get("generated_at")
+    elif name.startswith("universe"):
+        value = meta.get("universe_generated_at") or meta.get("generated_at")
+    else:
+        value = meta.get("generated_at")
+    if value:
+        return str(value)[:10]
     return "未知"
+
+
+def _write_seed_metadata(snapshot: pd.DataFrame, universe: pd.DataFrame):
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    meta = {
+        "generated_at": now,
+        "snapshot_generated_at": now,
+        "universe_generated_at": now,
+        "snapshot_rows": int(len(snapshot)),
+        "universe_rows": int(len(universe)),
+    }
+    with open(SEED_METADATA, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
 def save_seed(log=print):
@@ -158,12 +205,14 @@ def save_seed(log=print):
     uni = _fetch_universe()
     uni.to_parquet(_seed_path("universe.parquet"), index=False)
     log(f"  已存 seed/universe.parquet（{len(uni)} 檔）")
+    _write_seed_metadata(snap, uni)
+    log("  已更新 seed/metadata.json")
 
 
 # ===========================================================================
 # 證交所 / 櫃買：全市場批次
 # ===========================================================================
-def _get_json(url: str, retries: int = 3):
+def _get_json(url: str, retries: int = 3, cfg=None):
     """
     抓取證交所／櫃買 OpenAPI 並解析 JSON。
 
@@ -171,6 +220,7 @@ def _get_json(url: str, retries: int = 3):
     HTML 攔截頁而非 JSON。這裡不只看 content-type，直接嘗試解析 JSON，
     並在失敗時重試；最終失敗會帶出 HTTP 狀態碼與回應片段以利除錯。
     """
+    cfg = cfg or config
     last_err = None
     snippet = ""
     status = None
@@ -179,7 +229,12 @@ def _get_json(url: str, retries: int = 3):
     verify = True
     for attempt in range(retries):
         try:
-            r = _session.get(url, timeout=40, verify=verify)
+            if verify:
+                r = _session.get(url, timeout=40, verify=True)
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                    r = _session.get(url, timeout=40, verify=False)
             status = r.status_code
             r.raise_for_status()
             # WAF 攔截頁（HTTP 200 但內容是封鎖說明）→ 立即放棄，重試無意義。
@@ -195,7 +250,13 @@ def _get_json(url: str, retries: int = 3):
                 last_err = "回應非 JSON"
         except requests.exceptions.SSLError as e:
             last_err = f"SSL 憑證驗證失敗：{e}"
-            if verify:
+            allow_tpex_fallback = (
+                verify
+                and cfg.ALLOW_INSECURE_TPEX_SSL_FALLBACK
+                and url.startswith(TPEX)
+            )
+            if allow_tpex_fallback:
+                _logger.warning("TPEX SSL 驗證失敗，改以不驗證憑證重試公開資料端點：%s", url)
                 verify = False  # 下一輪不驗證憑證重試（僅限公開資料端點）
                 continue
         except requests.RequestException as e:
@@ -216,7 +277,16 @@ def _to_num(x):
         return None
 
 
-def get_market_snapshot(log=print) -> pd.DataFrame:
+def _require_columns(df: pd.DataFrame, required, source: str, allow_empty: bool = True):
+    """確認資料來源欄位符合預期；欄位變更時提供明確錯誤。"""
+    if df.empty and allow_empty:
+        return
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{source} 回傳欄位缺失：{', '.join(missing)}")
+
+
+def get_market_snapshot(log=print, cfg=None) -> pd.DataFrame:
     """
     取得全市場（上市+上櫃）最新一日的價量與估值快照。
     欄位：stock_id, name, close, lots(成交張數), pe, pb, yield_pct, board
@@ -225,26 +295,32 @@ def get_market_snapshot(log=print) -> pd.DataFrame:
     """
     cached = _load_cache_df("snapshot.parquet")
     if cached is not None:
+        _validate_snapshot_df(cached, "cache snapshot")
         return cached
     try:
-        df = _fetch_market_snapshot()
+        df = _fetch_market_snapshot(cfg=cfg)
         _save_cache_df(df, "snapshot.parquet")
         return df
     except Exception as e:
         seed = _load_seed_df("snapshot.parquet")
         if seed is not None:
+            _validate_snapshot_df(seed, "seed snapshot")
             log(f"⚠ 即時抓取快照失敗（{e}）；改用內建快照 seed（{_seed_date('snapshot.parquet')}）。")
             return seed
         raise
 
 
-def _fetch_market_snapshot() -> pd.DataFrame:
+def _fetch_market_snapshot(cfg=None) -> pd.DataFrame:
     """實際向證交所／櫃買 OpenAPI 抓取全市場快照（不含快取／後備邏輯）。"""
+    cfg = cfg or config
     rows = []
 
     # --- 上市每日收盤 ---
-    twse_daily = _get_json(f"{TWSE}/exchangeReport/STOCK_DAY_ALL")
-    for d in twse_daily:
+    twse_daily = _get_json(f"{TWSE}/exchangeReport/STOCK_DAY_ALL", cfg=cfg)
+    twse_daily_df = pd.DataFrame(twse_daily)
+    _require_columns(twse_daily_df, ["Code", "Name", "ClosingPrice", "TradeVolume"], "TWSE STOCK_DAY_ALL",
+                     allow_empty=False)
+    for _, d in twse_daily_df.iterrows():
         code = str(d.get("Code", "")).strip()
         if len(code) != 4 or not code.isdigit() or code[0] == "0":
             continue  # 排除 ETF/權證/特別股等非四碼普通股
@@ -259,7 +335,10 @@ def _fetch_market_snapshot() -> pd.DataFrame:
 
     # --- 上市本益比/淨值比 ---
     pe_map = {}
-    for d in _get_json(f"{TWSE}/exchangeReport/BWIBBU_ALL"):
+    twse_pe_df = pd.DataFrame(_get_json(f"{TWSE}/exchangeReport/BWIBBU_ALL", cfg=cfg))
+    _require_columns(twse_pe_df, ["Code", "PEratio", "PBratio", "DividendYield"], "TWSE BWIBBU_ALL",
+                     allow_empty=False)
+    for _, d in twse_pe_df.iterrows():
         code = str(d.get("Code", "")).strip()
         pe_map[code] = {
             "pe": _to_num(d.get("PEratio")),
@@ -268,8 +347,14 @@ def _fetch_market_snapshot() -> pd.DataFrame:
         }
 
     # --- 上櫃每日收盤（資料含多日，取最新日期）---
-    tpex_daily = _get_json(f"{TPEX}/tpex_mainboard_daily_close_quotes")
+    tpex_daily = _get_json(f"{TPEX}/tpex_mainboard_daily_close_quotes", cfg=cfg)
     tpex_df = pd.DataFrame(tpex_daily)
+    _require_columns(
+        tpex_df,
+        ["Date", "SecuritiesCompanyCode", "CompanyName", "Close", "TradingShares"],
+        "TPEX daily close",
+        allow_empty=False,
+    )
     if not tpex_df.empty and "Date" in tpex_df.columns:
         latest = tpex_df["Date"].max()
         tpex_df = tpex_df[tpex_df["Date"] == latest]
@@ -287,7 +372,14 @@ def _fetch_market_snapshot() -> pd.DataFrame:
         })
 
     # --- 上櫃本益比 ---
-    for d in _get_json(f"{TPEX}/tpex_mainboard_peratio_analysis"):
+    tpex_pe_df = pd.DataFrame(_get_json(f"{TPEX}/tpex_mainboard_peratio_analysis", cfg=cfg))
+    _require_columns(
+        tpex_pe_df,
+        ["SecuritiesCompanyCode", "PriceEarningRatio", "PriceBookRatio", "YieldRatio"],
+        "TPEX PE analysis",
+        allow_empty=False,
+    )
+    for _, d in tpex_pe_df.iterrows():
         code = str(d.get("SecuritiesCompanyCode", "")).strip()
         pe_map[code] = {
             "pe": _to_num(d.get("PriceEarningRatio")),
@@ -302,19 +394,21 @@ def _fetch_market_snapshot() -> pd.DataFrame:
     df = df[df["close"].notna() & (df["close"] > 0)].reset_index(drop=True)
     if df.empty:
         raise ValueError("快照解析後無有效資料（來源可能回傳空內容或攔截頁）。")
+    _validate_snapshot_df(df, "market snapshot")
     return df
 
 
-def get_universe(log=print) -> pd.DataFrame:
+def get_universe(log=print, cfg=None) -> pd.DataFrame:
     """全市場股票清單（含產業別），用於題材標記。欄位：stock_id, name, industry, board
 
     優先序：當日快取 → 即時抓取 → 內建快照（seed）。
     """
     cached = _load_cache_df("universe.parquet")
     if cached is not None:
+        _validate_universe_df(cached, "cache universe")
         return cached
     try:
-        df = _fetch_universe()
+        df = _fetch_universe(cfg=cfg)
         if not df.empty:
             _save_cache_df(df, "universe.parquet")
             return df
@@ -322,17 +416,19 @@ def get_universe(log=print) -> pd.DataFrame:
     except Exception as e:
         seed = _load_seed_df("universe.parquet")
         if seed is not None:
+            _validate_universe_df(seed, "seed universe")
             log(f"⚠ 即時抓取清單失敗（{e}）；改用內建快照 seed（{_seed_date('universe.parquet')}）。")
             return seed
         raise
 
 
-def _fetch_universe() -> pd.DataFrame:
+def _fetch_universe(cfg=None) -> pd.DataFrame:
     """實際向 FinMind 抓取全市場股票清單（不含快取／後備邏輯）。"""
-    data = _finmind_raw("TaiwanStockInfo")
+    data = _finmind_raw("TaiwanStockInfo", cfg=cfg)
     df = pd.DataFrame(data)
     if df.empty:
         return df
+    _require_columns(df, ["stock_id", "stock_name", "industry_category", "type"], "FinMind TaiwanStockInfo")
     df = df.rename(columns={
         "industry_category": "industry",
         "stock_name": "name",
@@ -347,7 +443,8 @@ def _fetch_universe() -> pd.DataFrame:
 # FinMind：逐檔抓取（含限流退避）
 # ===========================================================================
 def _finmind_raw(dataset: str, data_id: str = None,
-                 start_date: str = None, end_date: str = None):
+                 start_date: str = None, end_date: str = None, cfg=None):
+    cfg = cfg or config
     params = {"dataset": dataset}
     if data_id:
         params["data_id"] = data_id
@@ -355,40 +452,56 @@ def _finmind_raw(dataset: str, data_id: str = None,
         params["start_date"] = start_date
     if end_date:
         params["end_date"] = end_date
-    if config.FINMIND_TOKEN:
-        params["token"] = config.FINMIND_TOKEN
+    if cfg.FINMIND_TOKEN:
+        params["token"] = cfg.FINMIND_TOKEN
 
     did = data_id or "-"
     last_err = "未知原因"
     rate_limited = False
     # 共 1 次首抓 + 最多 FINMIND_MAX_RETRIES 次重試。
-    for attempt in range(config.FINMIND_MAX_RETRIES + 1):
+    for attempt in range(cfg.FINMIND_MAX_RETRIES + 1):
         try:
-            _rate_limit()  # 全域節流：跨並行緒控制請求速率（每次請求至少間隔 MIN_INTERVAL）
+            _rate_limit(cfg=cfg)  # 全域節流：跨並行緒控制請求速率（每次請求至少間隔 MIN_INTERVAL）
             r = _session.get(FINMIND, params=params, timeout=40)
             if r.status_code == 200:
+                payload = r.json()
+                if not isinstance(payload, dict) or "data" not in payload:
+                    msg = str(payload.get("msg") if isinstance(payload, dict) else payload)
+                    if "limit" in msg.lower() or "upper" in msg.lower():
+                        rate_limited = True
+                        last_err = f"限流訊息：{msg}"
+                        if attempt < cfg.FINMIND_MAX_RETRIES:
+                            wait = _backoff_seconds(attempt, cfg=cfg)
+                            _logger.warning(
+                                "FinMind 限流訊息：dataset=%s data_id=%s，等待 %d 秒後重試 %d/%d",
+                                dataset, did, wait, attempt + 1, cfg.FINMIND_MAX_RETRIES)
+                            time.sleep(wait)
+                            continue
+                        break
+                    raise RuntimeError(
+                        f"FinMind 回應缺少 data 欄位（dataset={dataset} data_id={did}）：{msg}")
                 if attempt > 0:
                     _logger.warning("FinMind 重試成功：%s %s", did, dataset)
-                return r.json().get("data", [])  # 乾淨 200：可能為空（真的沒資料）
+                return payload.get("data", [])  # 乾淨 200：可能為空（真的沒資料）
             # 402 / 429（或訊息含 limit／upper limit）→ 流量限制：退避後重試
             if r.status_code in (402, 429) or "limit" in r.text.lower():
                 rate_limited = True
                 last_err = f"限流 HTTP {r.status_code}"
-                if attempt < config.FINMIND_MAX_RETRIES:
-                    wait = _backoff_seconds(attempt)
+                if attempt < cfg.FINMIND_MAX_RETRIES:
+                    wait = _backoff_seconds(attempt, cfg=cfg)
                     _logger.warning(
                         "FinMind 限流 %s：dataset=%s data_id=%s，等待 %d 秒後重試 %d/%d",
-                        r.status_code, dataset, did, wait, attempt + 1, config.FINMIND_MAX_RETRIES)
+                        r.status_code, dataset, did, wait, attempt + 1, cfg.FINMIND_MAX_RETRIES)
                     time.sleep(wait)
                     continue
                 break  # 重試用盡
             r.raise_for_status()
         except requests.RequestException as e:
             last_err = str(e)
-            if attempt < config.FINMIND_MAX_RETRIES:
-                wait = _backoff_seconds(attempt)
+            if attempt < cfg.FINMIND_MAX_RETRIES:
+                wait = _backoff_seconds(attempt, cfg=cfg)
                 _logger.warning("FinMind 連線錯誤：%s，等待 %d 秒後重試 %d/%d",
-                                e, wait, attempt + 1, config.FINMIND_MAX_RETRIES)
+                                e, wait, attempt + 1, cfg.FINMIND_MAX_RETRIES)
                 time.sleep(wait)
                 continue
             break  # 重試用盡
@@ -402,7 +515,7 @@ def _finmind_raw(dataset: str, data_id: str = None,
 
 
 # ---- 逐檔當日快取：相同股號＋資料集在 CACHE_TTL_DAYS 內不重抓 ----
-def _finmind_cached(name: str, builder):
+def _finmind_cached(name: str, builder, required_columns=None, source: str = None):
     """name 為快取檔名；builder 為實際抓取並回傳 DataFrame 的函式。
 
     快取規則（避免壞資料污染）：
@@ -413,10 +526,14 @@ def _finmind_cached(name: str, builder):
     """
     cached = _load_cache_df(name)
     if cached is not None:
+        if required_columns:
+            _require_columns(cached, required_columns, source or name)
         _logger.debug("cache hit: %s", name)
         return cached
     _logger.debug("fetch api: %s", name)
     df = builder()
+    if required_columns:
+        _require_columns(df, required_columns, source or name)
     if df is not None and not df.empty:
         _save_cache_df(df, name)
     return df
@@ -426,38 +543,81 @@ def _recent_start(days: int) -> str:
     return (dt.date.today() - dt.timedelta(days=days)).isoformat()
 
 
-def fetch_price_history(stock_id: str) -> pd.DataFrame:
+def fetch_price_history(stock_id: str, cfg=None) -> pd.DataFrame:
+    cfg = cfg or config
     def build():
         data = _finmind_raw("TaiwanStockPrice", stock_id,
-                            _recent_start(int(config.PRICE_HISTORY_DAYS * 1.6)))
+                            _recent_start(int(cfg.PRICE_HISTORY_DAYS * 1.6)), cfg=cfg)
         df = pd.DataFrame(data)
         if not df.empty:
+            _require_columns(df, ["date", "close"], f"FinMind TaiwanStockPrice {stock_id}")
             df = df.sort_values("date").reset_index(drop=True)
         return df
-    return _finmind_cached(f"fm_price_{stock_id}.parquet", build)
+    return _finmind_cached(
+        f"fm_price_{stock_id}.parquet", build,
+        required_columns=["date", "close"],
+        source=f"FinMind TaiwanStockPrice {stock_id}",
+    )
 
 
-def fetch_month_revenue(stock_id: str) -> pd.DataFrame:
-    return _finmind_cached(f"fm_rev_{stock_id}.parquet", lambda: pd.DataFrame(
-        _finmind_raw("TaiwanStockMonthRevenue", stock_id, _recent_start(900))))
+def fetch_month_revenue(stock_id: str, cfg=None) -> pd.DataFrame:
+    def build():
+        df = pd.DataFrame(_finmind_raw("TaiwanStockMonthRevenue", stock_id, _recent_start(900), cfg=cfg))
+        _require_columns(df, ["date", "revenue"], f"FinMind TaiwanStockMonthRevenue {stock_id}")
+        return df
+    return _finmind_cached(
+        f"fm_rev_{stock_id}.parquet", build,
+        required_columns=["date", "revenue"],
+        source=f"FinMind TaiwanStockMonthRevenue {stock_id}",
+    )
 
 
-def fetch_income_statement(stock_id: str) -> pd.DataFrame:
-    return _finmind_cached(f"fm_income_{stock_id}.parquet", lambda: pd.DataFrame(
-        _finmind_raw("TaiwanStockFinancialStatements", stock_id, _recent_start(1500))))
+def fetch_income_statement(stock_id: str, cfg=None) -> pd.DataFrame:
+    def build():
+        df = pd.DataFrame(_finmind_raw("TaiwanStockFinancialStatements", stock_id, _recent_start(1500), cfg=cfg))
+        _require_columns(df, ["date", "type", "value"], f"FinMind TaiwanStockFinancialStatements {stock_id}")
+        return df
+    return _finmind_cached(
+        f"fm_income_{stock_id}.parquet", build,
+        required_columns=["date", "type", "value"],
+        source=f"FinMind TaiwanStockFinancialStatements {stock_id}",
+    )
 
 
-def fetch_balance_sheet(stock_id: str) -> pd.DataFrame:
-    return _finmind_cached(f"fm_bs_{stock_id}.parquet", lambda: pd.DataFrame(
-        _finmind_raw("TaiwanStockBalanceSheet", stock_id, _recent_start(1500))))
+def fetch_balance_sheet(stock_id: str, cfg=None) -> pd.DataFrame:
+    def build():
+        df = pd.DataFrame(_finmind_raw("TaiwanStockBalanceSheet", stock_id, _recent_start(1500), cfg=cfg))
+        _require_columns(df, ["date", "type", "value"], f"FinMind TaiwanStockBalanceSheet {stock_id}")
+        return df
+    return _finmind_cached(
+        f"fm_bs_{stock_id}.parquet", build,
+        required_columns=["date", "type", "value"],
+        source=f"FinMind TaiwanStockBalanceSheet {stock_id}",
+    )
 
 
-def fetch_institutional(stock_id: str) -> pd.DataFrame:
-    return _finmind_cached(f"fm_inst_{stock_id}.parquet", lambda: pd.DataFrame(
-        _finmind_raw("TaiwanStockInstitutionalInvestorsBuySell",
-                     stock_id, _recent_start(45))))
+def fetch_institutional(stock_id: str, cfg=None) -> pd.DataFrame:
+    def build():
+        df = pd.DataFrame(_finmind_raw("TaiwanStockInstitutionalInvestorsBuySell",
+                                       stock_id, _recent_start(45), cfg=cfg))
+        _require_columns(df, ["date", "name", "buy", "sell"],
+                         f"FinMind TaiwanStockInstitutionalInvestorsBuySell {stock_id}")
+        return df
+    return _finmind_cached(
+        f"fm_inst_{stock_id}.parquet", build,
+        required_columns=["date", "name", "buy", "sell"],
+        source=f"FinMind TaiwanStockInstitutionalInvestorsBuySell {stock_id}",
+    )
 
 
-def fetch_margin(stock_id: str) -> pd.DataFrame:
-    return _finmind_cached(f"fm_margin_{stock_id}.parquet", lambda: pd.DataFrame(
-        _finmind_raw("TaiwanStockMarginPurchaseShortSale", stock_id, _recent_start(20))))
+def fetch_margin(stock_id: str, cfg=None) -> pd.DataFrame:
+    def build():
+        df = pd.DataFrame(_finmind_raw("TaiwanStockMarginPurchaseShortSale", stock_id, _recent_start(20), cfg=cfg))
+        _require_columns(df, ["date", "MarginPurchaseTodayBalance"],
+                         f"FinMind TaiwanStockMarginPurchaseShortSale {stock_id}")
+        return df
+    return _finmind_cached(
+        f"fm_margin_{stock_id}.parquet", build,
+        required_columns=["date", "MarginPurchaseTodayBalance"],
+        source=f"FinMind TaiwanStockMarginPurchaseShortSale {stock_id}",
+    )
